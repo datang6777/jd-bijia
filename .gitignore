@@ -1,0 +1,9 @@
+.venv/
+.DS_Store
+chrome-profile/
+chrome-profile-headed/
+chrome-profile-pc/
+output/
+__pycache__/
+*.pyc
+.pytest_cache/
