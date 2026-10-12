@@ -77,7 +77,7 @@ python run.py --via chrome --chrome-debug-port 9222 --limit 20
 # 0）看还剩多少（不访问京东）
 python run.py --stats
 
-# 1）登录一次（本机弹窗）
+# 1）登录一次（本机弹窗）——或 Windows 上用已登录的 CDP Chrome
 python run.py --login
 
 # 2）先小批量试跑，例如 20 条
@@ -93,6 +93,24 @@ python run.py --limit 50
 # 6）确认流程稳定后，跑完所有未完成（仍建议分多次，或隔夜分批）
 python run.py --limit 0 --pick sequential
 ```
+
+### 搜索被频控时（Windows 常见）
+
+若页面出现「抱歉由于访问频繁导致无法搜索，请稍后再试！」：
+
+1. **先跑已有京东链接的行**（本工作簿大约两百条），不走搜索：
+
+```bat
+python run.py --via chrome --pick links --limit 0
+```
+
+2. 休息一段时间（工具在连续空搜/频控后也会自动冷却约 5–10 分钟）后再跑需要搜索的行：
+
+```bat
+python run.py --via chrome --pick search --limit 20
+```
+
+3. 频控锁定本轮后，无链接行会记「失败待重试」并跳过后续搜索；有链接行仍会打开商品页取价。
 
 ### 用仓库内工作簿
 
@@ -162,4 +180,5 @@ python -m unittest discover -s tests -v
 - Windows `--via chrome` 需 Chrome 以 `--remote-debugging-port` 运行（先退出再启动，或让工具自动拉起）
 - macOS `--via chrome` 默认 AppleScript；也可用 `--chrome-debug-port` 走 CDP
 - 云端/无 GUI 一般用 `--via http` + 事先 `--login`
+- 搜索频控时优先 `--pick links`，避免空搜把整批打成「京东无」或无效重试
 - 全量跑完后请人工复核「待复核」行，再决定是否回写业务表

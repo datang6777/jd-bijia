@@ -231,6 +231,18 @@ def run_batch(
             closer()
 
 
+_SEARCH_FAIL_MARKERS = (
+    "验证",
+    "人数过多",
+    "频控",
+    "访问频繁",
+    "无法搜索",
+    "搜索已被频控",
+    "没有读到商品列表",
+    "本轮其余搜索先跳过",
+)
+
+
 def _run_batch_loop(
     *,
     client,
@@ -242,15 +254,30 @@ def _run_batch_loop(
     consecutive_blocks: int,
     emit: Callable[[str], None],
 ) -> dict[str, int]:
+    search_tip_shown = False
     for index, product in enumerate(batch, start=1):
-        key = _identity(product)
-        if key in cache and not product.has_given_link:
-            decision, source = cache[key]
-            source = "同款复用"
+        if getattr(client, "search_blocked", False) and not search_tip_shown:
+            emit(
+                "搜索已被京东频控锁定本轮。建议先跑有链接的行："
+                "python run.py --pick links --limit 0"
+                "（本工作簿约有二百条已有京东链接）"
+            )
+            search_tip_shown = True
+        if getattr(client, "search_blocked", False) and not product.has_given_link:
+            decision = Decision(
+                status="失败待重试",
+                reason="搜索已被频控，本轮跳过无链接行；请稍后重试或先跑 --pick links",
+            )
+            source = "搜索频控跳过"
         else:
-            decision, source = _run_one(client, product, emit)
-            if not product.has_given_link:
-                cache[key] = (decision, source)
+            key = _identity(product)
+            if key in cache and not product.has_given_link:
+                decision, source = cache[key]
+                source = "同款复用"
+            else:
+                decision, source = _run_one(client, product, emit)
+                if not product.has_given_link:
+                    cache[key] = (decision, source)
         record = _record(product, decision, source)
         append_record(jsonl_path, record)
         export_xlsx(jsonl_path, xlsx_path)
@@ -259,18 +286,27 @@ def _run_batch_loop(
             f"[{index}/{len(batch)}] {decision.status} {product.pk_id} "
             f"{product.generic} {product.spec} -> {decision.price or '-'} {decision.shop or ''} {decision.reason}"
         )
-        if decision.status == "失败待重试" and any(word in decision.reason for word in ("验证", "人数过多", "频控")):
+        if decision.status == "失败待重试" and any(
+            word in decision.reason for word in _SEARCH_FAIL_MARKERS
+        ):
             consecutive_blocks += 1
         else:
             consecutive_blocks = 0
-        if consecutive_blocks >= 3:
-            emit("连续被京东拦住，休息 3 分钟后放慢继续")
-            time.sleep(180)
+        # 验证码/频控/连续空搜：冷却 5–10 分钟后再继续搜索类请求
+        if consecutive_blocks >= 2:
+            cool = random.uniform(300, 600)
+            emit(
+                f"连续被京东搜索拦住或空结果，冷却 {int(cool // 60)} 分钟后放慢继续；"
+                "也可中断后改用 python run.py --pick links"
+            )
+            time.sleep(cool)
             client.slow = True
             consecutive_blocks = 0
         time.sleep(random.uniform(0.8, 1.6))
     emit("汇总 " + "，".join(f"{name} {value}" for name, value in counts.items()))
     emit(f"结果文件 {xlsx_path}")
+    if getattr(client, "search_blocked", False):
+        emit("本批搜索曾被频控。未完成的有链接行可用：python run.py --pick links --limit 0")
     return counts
 
 

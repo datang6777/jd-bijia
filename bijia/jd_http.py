@@ -52,7 +52,7 @@ class JdHttp:
         if self.login_required:
             raise JdLoginRequired("京东要求登录后才能搜索")
         if self.search_blocked:
-            raise JdBlocked("搜索连续被京东拦住，本轮其余搜索先跳过")
+            raise JdBlocked("搜索已被频控，本轮其余搜索先跳过；请改用 --pick links 或稍后再试")
         html, final = self._get(
             f"https://so.m.jd.com/ware/search.action?keyword={quote(keyword)}",
             referer="https://m.jd.com/",
@@ -62,7 +62,10 @@ class JdHttp:
         except JdLoginRequired:
             self.login_required = True
             raise
-        except JdBlocked:
+        except JdBlocked as first:
+            if "访问频繁" in str(first) or "无法搜索" in str(first):
+                self.search_blocked = True
+                raise
             time.sleep(45)
             html, final = self._get(
                 f"https://so.m.jd.com/ware/search.action?keyword={quote(keyword)}",
@@ -73,9 +76,13 @@ class JdHttp:
             except JdLoginRequired:
                 self.login_required = True
                 raise
-            except JdBlocked:
+            except JdBlocked as second:
                 self.search_blocked = True
-                raise JdBlocked("搜索连续被京东拦住，本轮其余搜索先跳过") from None
+                if "访问频繁" in str(second) or "无法搜索" in str(second):
+                    raise
+                raise JdBlocked(
+                    "搜索连续被京东拦住，本轮其余搜索先跳过；有京东链接的行请改用 --pick links"
+                ) from None
         cards: list[SearchCard] = []
         seen: set[str] = set()
         for sku, title in _search_hits(html):
@@ -169,7 +176,17 @@ def _search_hits(html: str) -> list[tuple[str, str]]:
 
 
 def _raise_for_gate(html: str, final: str, allow_item: bool) -> None:
-    blob = f"{final}\n{html[:500]}"
+    blob = f"{final}\n{html[:800]}"
+    if (
+        "访问频繁" in blob
+        or "无法搜索" in blob
+        or "搜索太频繁" in blob
+        or ("搜索" in blob and "稍后再试" in blob)
+    ):
+        raise JdBlocked(
+            "京东搜索频控：访问频繁导致无法搜索，请稍后再试。"
+            "本轮其余搜索先跳过；有京东链接的行请改用 --pick links"
+        )
     if "risk_handler" in blob or "验证一下" in blob or "pc-frequent-pro" in final:
         raise JdBlocked("京东弹出了验证或频控，等待后重试")
     if "人数过多" in html:

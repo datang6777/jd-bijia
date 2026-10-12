@@ -283,17 +283,20 @@ class JdChromeAppleScript:
         if self.login_required:
             raise JdLoginRequired("京东要求登录后才能搜索")
         if self.search_blocked:
-            raise JdBlocked("搜索连续被京东拦住，本轮其余搜索先跳过")
+            raise JdBlocked("搜索已被频控，本轮其余搜索先跳过；请改用 --pick links 或稍后再试")
         self._goto(f"https://search.jd.com/Search?keyword={quote(keyword)}&enc=utf-8")
         payload = self._wait_search()
-        if _is_risk(payload.get("href", ""), payload.get("text", "")):
+        text = payload.get("text") or ""
+        href = payload.get("href") or ""
+        if _is_search_limited(href, text) or _is_risk(href, text):
             self.search_blocked = True
-            raise JdBlocked("搜索连续被京东拦住，本轮其余搜索先跳过")
-        if "plogin" in payload.get("href", "") or "请登录" in (payload.get("text") or "")[:200]:
+            raise JdBlocked(_search_block_reason(text))
+        if "plogin" in href or "请登录" in text[:200]:
             self.login_required = True
             raise JdLoginRequired("搜索页要求重新登录京东")
         if not payload.get("items"):
-            raise JdBlocked("搜索页没有读到商品列表")
+            # 空列表也可能是软频控：连续出现时由 runner 加长冷却
+            raise JdBlocked("搜索页没有读到商品列表（可能被频控），稍后重试或改用 --pick links")
         return _cards_from_search(payload)
 
     def _goto(self, url: str) -> None:
@@ -475,17 +478,19 @@ class JdChromeCDP:
         if self.login_required:
             raise JdLoginRequired("京东要求登录后才能搜索")
         if self.search_blocked:
-            raise JdBlocked("搜索连续被京东拦住，本轮其余搜索先跳过")
+            raise JdBlocked("搜索已被频控，本轮其余搜索先跳过；请改用 --pick links 或稍后再试")
         self._goto(f"https://search.jd.com/Search?keyword={quote(keyword)}&enc=utf-8")
         payload = self._wait_search()
-        if _is_risk(payload.get("href", ""), payload.get("text", "")):
+        text = payload.get("text") or ""
+        href = payload.get("href") or ""
+        if _is_search_limited(href, text) or _is_risk(href, text):
             self.search_blocked = True
-            raise JdBlocked("搜索连续被京东拦住，本轮其余搜索先跳过")
-        if "plogin" in payload.get("href", "") or "请登录" in (payload.get("text") or "")[:200]:
+            raise JdBlocked(_search_block_reason(text))
+        if "plogin" in href or "请登录" in text[:200]:
             self.login_required = True
             raise JdLoginRequired("搜索页要求重新登录京东")
         if not payload.get("items"):
-            raise JdBlocked("搜索页没有读到商品列表")
+            raise JdBlocked("搜索页没有读到商品列表（可能被频控），稍后重试或改用 --pick links")
         return _cards_from_search(payload)
 
     def _goto(self, url: str) -> None:
@@ -612,8 +617,35 @@ def _region_from_text(text: str) -> str:
     return match.group(1) if match else ""
 
 
+def _is_search_limited(url: str, text: str) -> bool:
+    blob = f"{url}\n{(text or '')[:800]}"
+    if "无法搜索" in blob or "访问频繁" in blob or "搜索太频繁" in blob or "搜索频繁" in blob:
+        return True
+    # 「请稍后再试」 alone 太宽；与搜索页语境组合
+    if "搜索" in blob and ("请稍后再试" in blob or "稍后再试" in blob):
+        return True
+    return False
+
+
+def _search_block_reason(text: str) -> str:
+    snippet = re.sub(r"\s+", "", (text or ""))[:80]
+    if "访问频繁" in (text or "") or "无法搜索" in (text or ""):
+        return (
+            "京东搜索频控：访问频繁导致无法搜索，请稍后再试。"
+            "本轮其余搜索先跳过；有京东链接的行请改用 --pick links"
+            + (f"（页面：{snippet}）" if snippet else "")
+        )
+    return (
+        "京东搜索被拦住（验证/频控），本轮其余搜索先跳过；"
+        "有京东链接的行请改用 --pick links"
+        + (f"（页面：{snippet}）" if snippet else "")
+    )
+
+
 def _is_risk(url: str, text: str) -> bool:
-    blob = f"{url}\n{(text or '')[:400]}"
+    blob = f"{url}\n{(text or '')[:800]}"
+    if _is_search_limited(url, text):
+        return True
     return any(word in blob for word in ("risk_handler", "暂时无法展示", "验证一下", "人数过多", "安全验证"))
 
 
