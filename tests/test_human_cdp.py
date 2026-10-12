@@ -69,6 +69,15 @@ class HumanFlagTests(unittest.TestCase):
         self.assertEqual(kwargs["max_gap"], 40)
         self.assertFalse(kwargs["auto_launch"])
 
+    def test_human_dwell_uses_random_without_nameerror(self) -> None:
+        client = jd_chrome.JdChromeCDP.__new__(jd_chrome.JdChromeCDP)
+        page = mock.Mock()
+        page.mouse.wheel = mock.Mock()
+        client._page = page
+        with mock.patch.object(jd_chrome.time, "sleep"):
+            client._human_dwell()
+        self.assertTrue(page.mouse.wheel.called)
+
 
 if __name__ == "__main__":
     unittest.main()
