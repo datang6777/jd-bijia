@@ -46,19 +46,60 @@ SEARCH_JS = r"""
   const text = ((document.body && document.body.innerText) || "").replace(/\s+/g, " ").trim();
   const seen = new Set();
   const items = [];
-  for (const card of document.querySelectorAll("[data-sku]")) {
+  const nodes = document.querySelectorAll(
+    "li.gl-item[data-sku], .gl-item[data-sku], [data-sku]"
+  );
+  for (const card of nodes) {
     const sku = card.getAttribute("data-sku") || "";
     if (!/^\d{6,}$/.test(sku) || seen.has(sku)) continue;
     const cardText = (card.innerText || "").replace(/\s+/g, " ").trim();
     if (cardText.length < 8) continue;
+
+    let title = "";
+    const nameEl = card.querySelector(
+      ".p-name em, .p-name a em, .p-name a, a[title], [class*='title']"
+    );
+    if (nameEl) title = (nameEl.getAttribute("title") || nameEl.innerText || "")
+      .replace(/\s+/g, " ").trim();
+    if (!title) title = cardText.slice(0, 180);
+
+    let price = null;
+    const priceEl = card.querySelector(
+      ".p-price i, .p-price strong, .p-price .J_price, .p-price [data-price], [class*='price'] i, [class*='Price']"
+    );
+    if (priceEl) {
+      const raw = (priceEl.getAttribute("data-price") || priceEl.innerText || "").replace(/,/g, "");
+      const m = raw.match(/(\d+(?:\.\d{1,2})?)/);
+      if (m) price = parseFloat(m[1]);
+    }
+    if (price == null) {
+      const m = cardText.match(/[¥￥]\s*(\d+(?:\.\d{1,2})?)/);
+      if (m) price = parseFloat(m[1]);
+    }
+
+    let shop = "";
+    const shopEl = card.querySelector(
+      ".p-shop a, .p-shopspan, .curr-shop, [class*='shop'] a, .hd-shopname"
+    );
+    if (shopEl) shop = (shopEl.innerText || "").replace(/\s+/g, " ").trim();
+
+    const selfOperated =
+      /自营/.test(cardText) ||
+      !!card.querySelector(".p-icons .goods-icons, i.goods-icons, [class*='zy-'], .sprite-zy");
+    if (selfOperated && shop && shop.indexOf("自营") < 0) shop = shop + " 自营";
+    if (selfOperated && !shop) shop = "京东自营";
+
     seen.add(sku);
     items.push({
       sku: sku,
       url: "https://item.jd.com/" + sku + ".html",
-      title: cardText.slice(0, 180),
-      text: cardText.slice(0, 500)
+      title: title.slice(0, 180),
+      text: cardText.slice(0, 500),
+      shop: shop,
+      price: price,
+      self_operated: selfOperated
     });
-    if (items.length >= 20) break;
+    if (items.length >= 30) break;
   }
   return JSON.stringify({
     href: location.href,
@@ -226,6 +267,7 @@ def create_jd_chrome(
     human: bool = False,
     min_gap: float = 30.0,
     max_gap: float = 60.0,
+    search_only: bool = False,
 ) -> "JdChromeAppleScript | JdChromeCDP":
     backend, port = resolve_chrome_backend(debug_port)
     if backend == "cdp":
@@ -238,10 +280,13 @@ def create_jd_chrome(
             human=human,
             min_gap=min_gap,
             max_gap=max_gap,
+            search_only=search_only,
         )
     if human and log:
         log("注意：--human 仅对 CDP（Windows / --chrome-debug-port）生效；当前为 AppleScript 后端")
-    return JdChromeAppleScript()
+    client = JdChromeAppleScript()
+    client.search_only = search_only
+    return client
 
 
 class JdChrome:
@@ -256,6 +301,7 @@ class JdChrome:
         human: bool = False,
         min_gap: float = 30.0,
         max_gap: float = 60.0,
+        search_only: bool = False,
     ):
         return create_jd_chrome(
             debug_port=debug_port,
@@ -265,6 +311,7 @@ class JdChrome:
             human=human,
             min_gap=min_gap,
             max_gap=max_gap,
+            search_only=search_only,
         )
 
 
@@ -301,6 +348,14 @@ class JdChromeAppleScript:
         self.search_blocked = False
         self.login_required = False
         self.backend = "applescript"
+        self.search_only = False
+        self.human = False
+        self.min_gap = 30.0
+        self.max_gap = 60.0
+
+    def search_list_offers(self, keyword: str) -> list[Offer]:
+        cards = self.search(keyword)
+        return [offer_from_search_card(card) for card in cards if card.sku]
 
     def close(self) -> None:
         return
@@ -459,6 +514,7 @@ class JdChromeCDP:
         human: bool = False,
         min_gap: float = 30.0,
         max_gap: float = 60.0,
+        search_only: bool = False,
     ) -> None:
         self.port = int(port)
         self.slow = False
@@ -466,6 +522,7 @@ class JdChromeCDP:
         self.login_required = False
         self.backend = "cdp"
         self.human = bool(human)
+        self.search_only = bool(search_only)
         self.min_gap = float(min_gap)
         self.max_gap = max(float(max_gap), self.min_gap)
         self._log = log or (lambda message: print(message, flush=True))
@@ -503,6 +560,8 @@ class JdChromeCDP:
                 f"拟人模式已开启：搜索框逐字输入、停留滚动、验证页等人手过；"
                 f"行间隔 {self.min_gap:.0f}–{self.max_gap:.0f}s"
             )
+        if self.search_only:
+            self._log("search-only：只读搜索列表价，不打开 item.jd.com 商品页")
 
     def _apply_stealth(self) -> None:
         assert self._page is not None
@@ -534,6 +593,8 @@ class JdChromeCDP:
         self._playwright = None
 
     def open_offer(self, url: str, hint: SearchCard | None = None) -> Offer | None:
+        if self.search_only:
+            raise JdBlocked("search-only 模式禁止打开商品页；请只用搜索列表")
         sku = _sku_from_url(url)
         if not sku:
             return None
@@ -556,6 +617,17 @@ class JdChromeCDP:
         if offer.price_source == "需要登录":
             raise JdLoginRequired("这个 Chrome 窗口里京东没有显示券后价（请确认已登录）")
         return offer
+
+    def search_list_offers(self, keyword: str) -> list[Offer]:
+        """只在搜索结果页取价，绝不进入 item.jd.com。"""
+        cards = self.search(keyword)
+        # 懒加载价格：再滚一点后重读
+        if self.human:
+            self._human_dwell()
+            payload = self._wait_search()
+            if payload.get("items"):
+                cards = _cards_from_search(payload)
+        return [offer_from_search_card(card) for card in cards if card.sku]
 
     def search(self, keyword: str) -> list[SearchCard]:
         if self.login_required:
@@ -772,17 +844,51 @@ def _cards_from_search(payload: dict) -> list[SearchCard]:
     cards: list[SearchCard] = []
     for item in payload.get("items") or []:
         text = item.get("text") or ""
+        shop = (item.get("shop") or "").strip() or _shop_from_text(text[:400])
+        price = item.get("price")
+        if isinstance(price, str):
+            try:
+                price = float(price)
+            except ValueError:
+                price = None
         cards.append(
             SearchCard(
                 sku=str(item.get("sku") or ""),
                 url=item.get("url") or "",
                 title=(item.get("title") or text).strip(),
                 text=text,
-                shop=_shop_from_text(text[:400]),
+                shop=shop,
                 sales=parse_sales(text),
+                price=float(price) if isinstance(price, (int, float)) and price > 0 else None,
+                self_operated=bool(item.get("self_operated")),
             )
         )
     return cards
+
+
+def offer_from_search_card(card: SearchCard) -> Offer:
+    """把搜索列表卡片转成 Offer（不打开商品页）。"""
+    price = card.price
+    shop = card.shop or _shop_from_text(card.text[:400])
+    if card.self_operated and shop and "自营" not in shop:
+        shop = f"{shop} 自营"
+    source = ""
+    if price is not None:
+        source = "搜索列表价"
+    elif "登录" in (card.text or ""):
+        source = "需要登录"
+    return Offer(
+        sku=card.sku,
+        url=card.url or f"https://item.jd.com/{card.sku}.html",
+        title=card.title,
+        shop=shop,
+        coupon_price=None,
+        jd_price=price,
+        sales=card.sales,
+        in_stock=True,
+        page_text=f"{card.title} {card.shop} {card.text}"[:4000],
+        price_source=source,
+    )
 
 
 def _parse_js_payload(raw: str | None) -> dict:

@@ -84,6 +84,11 @@ def main() -> None:
         default=60.0,
         help="拟人模式下每行之间的最长间隔秒数（默认 60）",
     )
+    parser.add_argument(
+        "--search-only",
+        action="store_true",
+        help="只从搜索列表取价，绝不打开 item.jd.com（推荐与 --human 同用；有链接则按 SKU 在列表中匹配）",
+    )
     parser.add_argument("--headed", action="store_true", help="显示浏览器窗口（仅部分路径）")
     parser.add_argument("--probe", default="", help="只打开一个京东商品链接，确认能读到券后价")
     parser.add_argument(
@@ -129,6 +134,7 @@ def main() -> None:
         human=args.human,
         min_gap=args.min_gap,
         max_gap=args.max_gap,
+        search_only=args.search_only,
     )
 
 

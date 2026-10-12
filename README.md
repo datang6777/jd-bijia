@@ -36,8 +36,8 @@ python run.py --via chrome --chrome-debug-port 9222 --limit 20 --pick sequential
 4. **拟人模式（推荐，减少 CDP 一打开就被拦）**：复用已有京东标签、搜索框逐字输入、停留滚动；遇验证页会等人手过（最多约 3 分钟）。行间隔默认 30–60 秒。
 
 ```bat
-rem 先手动打开一个 jd.com 标签并登录，再：
-py -3 run.py --via chrome --chrome-debug-port 9222 --no-chrome-launch --human --pick links --limit 3 --input .\全量比价.xlsx
+rem 先手动打开 search.jd.com（或任意京东页）并登录。商品详情页常被 403，请加 --search-only：
+py -3 run.py --via chrome --chrome-debug-port 9222 --no-chrome-launch --human --search-only --limit 3 --input .\全量比价.xlsx
 ```
 
 **备选（不附着本机日常 Chrome）**：`python run.py --login` 后改用 `python run.py --via http --limit 20`。

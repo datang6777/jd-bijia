@@ -180,6 +180,7 @@ def run_batch(
     human: bool = False,
     min_gap: float = 30.0,
     max_gap: float = 60.0,
+    search_only: bool = False,
 ) -> dict[str, int]:
     emit: Callable[[str], None] = log or (lambda message: print(message, flush=True))
     input_path = resolve_input_path(input_path)
@@ -212,6 +213,7 @@ def run_batch(
             human=human,
             min_gap=min_gap,
             max_gap=max_gap,
+            search_only=search_only,
         )
         backend = getattr(client, "backend", "chrome")
         if backend == "cdp":
@@ -219,12 +221,16 @@ def run_batch(
                 emit("使用 Chrome CDP 拟人模式：复用京东标签、慢速输入/停留，不新开自动化标签")
             else:
                 emit("使用 Chrome CDP（远程调试）驱动已登录窗口")
+            if search_only:
+                emit("search-only：只从搜索列表取价，不打开商品详情页")
         else:
             emit("使用当前已登录的 Chrome（AppleScript），会新开一个京东标签页")
     else:
         client = JdHttp(cookie_file=profile_dir / "jd-state.json")
         if human:
             emit("提示：--human 仅对 --via chrome（CDP）生效，当前为 http 模式")
+        if search_only:
+            emit("提示：--search-only 需要 --via chrome")
     try:
         return _run_batch_loop(
             client=client,
@@ -235,6 +241,7 @@ def run_batch(
             cache=cache,
             consecutive_blocks=consecutive_blocks,
             emit=emit,
+            search_only=search_only,
         )
     finally:
         closer = getattr(client, "close", None)
@@ -264,6 +271,7 @@ def _run_batch_loop(
     cache: dict[tuple, tuple[Decision, str]],
     consecutive_blocks: int,
     emit: Callable[[str], None],
+    search_only: bool = False,
 ) -> dict[str, int]:
     search_tip_shown = False
     for index, product in enumerate(batch, start=1):
@@ -274,10 +282,16 @@ def _run_batch_loop(
                 "（本工作簿约有二百条已有京东链接）"
             )
             search_tip_shown = True
-        if getattr(client, "search_blocked", False) and not product.has_given_link:
+        if getattr(client, "search_blocked", False) and not product.has_given_link and not search_only:
             decision = Decision(
                 status="失败待重试",
                 reason="搜索已被频控，本轮跳过无链接行；请稍后重试或先跑 --pick links",
+            )
+            source = "搜索频控跳过"
+        elif getattr(client, "search_blocked", False) and search_only:
+            decision = Decision(
+                status="失败待重试",
+                reason="搜索已被频控，本轮跳过；请在搜索页手动验证或稍后再试",
             )
             source = "搜索频控跳过"
         else:
@@ -286,7 +300,7 @@ def _run_batch_loop(
                 decision, source = cache[key]
                 source = "同款复用"
             else:
-                decision, source = _run_one(client, product, emit)
+                decision, source = _run_one(client, product, emit, search_only=search_only)
                 if not product.has_given_link:
                     cache[key] = (decision, source)
         record = _record(product, decision, source)
@@ -328,13 +342,21 @@ def _run_batch_loop(
     return counts
 
 
-def _run_one(client: JdHttp | JdChrome, product: Product, log: Callable[[str], None]) -> tuple[Decision, str]:
+def _run_one(
+    client: JdHttp | JdChrome,
+    product: Product,
+    log: Callable[[str], None],
+    search_only: bool = False,
+) -> tuple[Decision, str]:
     last_error = ""
     link_decision: Decision | None = None
+    use_search_only = search_only or getattr(client, "search_only", False)
     # 拟人模式里验证页已在客户端等人手过，避免再快速连打 3 次
-    attempts = 1 if getattr(client, "human", False) else 3
+    attempts = 1 if getattr(client, "human", False) or use_search_only else 3
     for attempt in range(attempts):
         try:
+            if use_search_only:
+                return _run_one_search_only(client, product, log)
             if product.has_given_link:
                 offer = client.open_offer(product.given_link)
                 if offer is None or not offer.title:
@@ -382,6 +404,64 @@ def _run_one(client: JdHttp | JdChrome, product: Product, log: Callable[[str], N
             if attempt >= attempts - 1:
                 break
     return Decision(status="失败待重试", reason=last_error or "重试后仍失败"), "失败"
+
+
+def _run_one_search_only(
+    client,
+    product: Product,
+    log: Callable[[str], None],
+) -> tuple[Decision, str]:
+    """不打开商品页：只在搜索列表匹配（有链接时优先同 SKU）。"""
+    from bijia.jd_chrome import _sku_from_url
+
+    prefer_sku = _sku_from_url(product.given_link) if product.has_given_link else ""
+    offers: list[Offer] = []
+    for keyword in _search_only_keywords(product):
+        log(f"  搜索列表：{keyword}")
+        if hasattr(client, "search_list_offers"):
+            batch = client.search_list_offers(keyword)
+        else:
+            # http 等后端无列表价能力时仍禁止 open_offer 路径
+            raise JdBlocked("当前后端不支持 search-only 列表取价，请用 --via chrome")
+        offers.extend(batch)
+        decision = decide(product, offers, True, prefer_sku=prefer_sku)
+        if decision.status in {"已匹配", "待复核"}:
+            return decision, "搜索列表"
+        if prefer_sku and any(item.sku == prefer_sku for item in offers):
+            # SKU 在列表里但规格/价格未过：仍返回 decide 结果
+            return decision, "搜索列表"
+        time.sleep(random.uniform(0.8, 1.6))
+    return decide(product, offers, True, prefer_sku=prefer_sku), "搜索列表"
+
+
+def _search_only_keywords(product: Product) -> list[str]:
+    name = (product.name or "").strip()
+    brand = (product.brand or "").strip()
+    generic = (product.generic or "").strip()
+    spec = (product.spec or "").strip()
+    base = name or " ".join(part for part in (brand, generic) if part).strip()
+    queries: list[str] = []
+    if base and spec and spec not in base:
+        queries.append(f"{base} {spec}")
+    elif base:
+        queries.append(base)
+    elif spec:
+        queries.append(spec)
+    # 可选加「自营」再搜一轮，提高旗舰/大药房命中
+    if queries:
+        queries.append(f"{queries[0]} 自营")
+    # 再退回通用关键词逻辑
+    for item in _keywords(product):
+        if item not in queries:
+            queries.append(item)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in queries:
+        text = " ".join(item.split())
+        if text and text not in seen:
+            seen.add(text)
+            ordered.append(text)
+    return ordered[:4]
 
 
 def _search_offers(client: JdHttp | JdChrome, product: Product) -> list[Offer]:
