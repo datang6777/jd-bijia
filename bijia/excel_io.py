@@ -111,6 +111,7 @@ def select_rows(products: list[Product], limit: int, pick: str, done: set[str] |
 
 
 def load_done_ids(jsonl_path: Path) -> set[str]:
+    """终态 ID 集合。不含「失败待重试」，因此重跑会自动续跑失败行。"""
     if not jsonl_path.exists():
         return set()
     done: set[str] = set()
@@ -144,7 +145,7 @@ def export_xlsx(jsonl_path: Path, xlsx_path: Path) -> None:
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
     book = Workbook()
     sheet = book.active
-    sheet.title = "试跑结果"
+    sheet.title = "比价结果"
     sheet.append(RESULT_FIELDS)
     for pk in order:
         record = latest[pk]

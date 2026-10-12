@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""京东比价试跑。
+"""京东比价入口。
 
-默认从桌面上的全量表取 100 条：一半用表里已有链接，一半自己搜索。
-不改原表，结果写到 output/试跑100.xlsx。
+默认输入：环境变量 BIJIA_INPUT，否则仓库根目录「全量比价.xlsx」，
+再否则尝试 ~/Desktop（或 ~/桌面）上的同名/副本表。
+结果默认写到 output/比价结果.xlsx 与 output/比价结果.jsonl（jsonl 用于断点续跑）。
+「失败待重试」不会记入终态，再次运行会自动重跑。
 """
 
 from __future__ import annotations
@@ -12,22 +14,58 @@ import time
 from pathlib import Path
 
 from bijia.jd_browser import JdBrowser
-from bijia.runner import DEFAULT_INPUT, DEFAULT_JSONL, DEFAULT_OUTPUT, DEFAULT_PROFILE, run_batch
+from bijia.runner import (
+    DEFAULT_INPUT,
+    DEFAULT_JSONL,
+    DEFAULT_OUTPUT,
+    DEFAULT_PROFILE,
+    resolve_input_path,
+    run_batch,
+    summarize_progress,
+)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="京东比价")
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--jsonl", type=Path, default=DEFAULT_JSONL)
-    parser.add_argument("--profile", type=Path, default=DEFAULT_PROFILE)
-    parser.add_argument("--limit", type=int, default=100, help="条数，0 表示未完成的全部")
-    parser.add_argument("--pick", choices=("mixed", "links", "search", "sequential"), default="mixed")
-    parser.add_argument("--via", choices=("chrome", "http"), default="chrome", help="chrome 用当前已登录的窗口")
-    parser.add_argument("--headed", action="store_true", help="显示浏览器窗口")
-    parser.add_argument("--probe", default="", help="只打开一个京东商品链接，用来确认能读到券后价")
-    parser.add_argument("--login", action="store_true", help="打开浏览器登录京东，登录后才能看到券后价和搜索")
+    parser = argparse.ArgumentParser(
+        description="京东比价（只读原表，结果写到 output/；可用 jsonl 断点续跑）"
+    )
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=None,
+        help=f"输入 xlsx。默认：BIJIA_INPUT 或仓库/桌面候选（当前解析为 {DEFAULT_INPUT}）",
+    )
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="导出结果 xlsx")
+    parser.add_argument("--jsonl", type=Path, default=DEFAULT_JSONL, help="断点续跑 jsonl")
+    parser.add_argument("--profile", type=Path, default=DEFAULT_PROFILE, help="登录态目录（含 jd-state.json）")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="本批条数；0 表示所有未完成（含失败待重试）",
+    )
+    parser.add_argument(
+        "--pick",
+        choices=("mixed", "links", "search", "sequential"),
+        default="mixed",
+        help="挑行方式：mixed 链接/搜索各半；sequential 按表顺序",
+    )
+    parser.add_argument(
+        "--via",
+        choices=("chrome", "http"),
+        default="chrome",
+        help="chrome=本机已登录 Chrome；http=用 --login 保存的 cookie",
+    )
+    parser.add_argument("--headed", action="store_true", help="显示浏览器窗口（仅部分路径）")
+    parser.add_argument("--probe", default="", help="只打开一个京东商品链接，确认能读到券后价")
+    parser.add_argument("--login", action="store_true", help="打开浏览器登录京东（券后价/搜索需要）")
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="只统计未完成/失败待重试数量，不访问京东",
+    )
     args = parser.parse_args()
+    input_path = resolve_input_path(args.input)
 
     if args.login:
         _login(args.profile)
@@ -37,8 +75,16 @@ def main() -> None:
         _probe(args.probe, args.profile, headless=not args.headed)
         return
 
+    if args.stats:
+        stats = summarize_progress(input_path, args.jsonl)
+        print(f"输入表 {input_path}")
+        for key, value in stats.items():
+            print(f"{key}: {value}")
+        print("说明：终态=已匹配/待复核/京东无；失败待重试会在下次 run 时自动重跑。")
+        return
+
     run_batch(
-        input_path=args.input,
+        input_path=input_path,
         xlsx_path=args.output,
         jsonl_path=args.jsonl,
         profile_dir=args.profile,
@@ -124,8 +170,12 @@ def _login(profile: Path) -> None:
         print("8 分钟内没有检测到登录。")
         return
     offer = JdHttp(state_path).open_offer("https://item.jd.com/10099459140643.html")
-    print(f"登录后试读：券后价 {offer.coupon_price if offer else None}，京东价 {offer.jd_price if offer else None}，口径 {offer.price_source if offer else ''}")
-    print(f"登录状态已保存。重新运行 python run.py 即可继续比价。")
+    print(
+        f"登录后试读：券后价 {offer.coupon_price if offer else None}，"
+        f"京东价 {offer.jd_price if offer else None}，"
+        f"口径 {offer.price_source if offer else ''}"
+    )
+    print("登录状态已保存。重新运行 python run.py 即可继续比价。")
 
 
 if __name__ == "__main__":

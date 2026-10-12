@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import os
 import random
 import time
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 
-from bijia.excel_io import append_record, export_xlsx, load_done_ids, load_products, select_rows
+from bijia.excel_io import append_record, export_xlsx, load_done_ids, load_products, select_rows, unfinished
 from bijia.jd_browser import JdBlocked, SearchCard
 from bijia.jd_chrome import JdChrome
 from bijia.jd_http import JdHttp, JdLoginRequired
@@ -16,14 +19,90 @@ from bijia.models import Decision, Offer, Product
 from bijia.spec import parse_outer_pack, parse_spec
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = Path("/Users/zhaodatang/Desktop/副本全量比价1.xlsx")
-DEFAULT_OUTPUT = ROOT / "output" / "试跑100.xlsx"
-DEFAULT_JSONL = ROOT / "output" / "试跑100.jsonl"
+REPO_INPUT_NAME = "全量比价.xlsx"
+DEFAULT_OUTPUT = ROOT / "output" / "比价结果.xlsx"
+DEFAULT_JSONL = ROOT / "output" / "比价结果.jsonl"
 DEFAULT_PROFILE = ROOT / "chrome-profile"
 
 
+def _desktop_dirs() -> list[Path]:
+    home = Path.home()
+    return [home / "Desktop", home / "桌面"]
+
+
+def input_candidates() -> list[Path]:
+    """按优先级列出可能的输入表路径（不一定存在）。"""
+    names = (
+        REPO_INPUT_NAME,
+        "副本全量比价1.xlsx",
+        "副本全量比价.xlsx",
+        "全量比价1.xlsx",
+    )
+    candidates: list[Path] = [ROOT / REPO_INPUT_NAME]
+    for desktop in _desktop_dirs():
+        for name in names:
+            candidates.append(desktop / name)
+    # 去重但保序
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for path in candidates:
+        key = path.resolve() if path.exists() else path
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(path)
+    return ordered
+
+
+def resolve_default_input() -> Path:
+    """解析默认输入表：BIJIA_INPUT > 已存在的候选路径 > 仓库内 全量比价.xlsx。"""
+    env = (os.environ.get("BIJIA_INPUT") or "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    for path in input_candidates():
+        if path.is_file():
+            return path.resolve()
+    return (ROOT / REPO_INPUT_NAME).resolve()
+
+
+def resolve_input_path(path: Path | str | None = None) -> Path:
+    """CLI/调用方传入的 --input；空则走默认解析。"""
+    if path is None or str(path).strip() == "":
+        return resolve_default_input()
+    return Path(path).expanduser().resolve()
+
+
+# 模块导入时解析一次，供 argparse default 与外部引用；运行前仍会再 resolve。
+DEFAULT_INPUT = resolve_default_input()
+
+
+def summarize_progress(input_path: Path, jsonl_path: Path) -> dict[str, int]:
+    """只读统计：表内未填京东价、jsonl 终态、失败待重试、本批可跑。不访问京东。"""
+    products = load_products(input_path)
+    open_rows = unfinished(products)
+    done = load_done_ids(jsonl_path)
+    pending = [item for item in open_rows if item.pk_id not in done]
+    failed = 0
+    if jsonl_path.exists():
+        latest: dict[str, str] = {}
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            latest[record["普康商品ID"]] = record.get("状态", "")
+        failed = sum(1 for status in latest.values() if status == "失败待重试")
+    return {
+        "表内总行": len(products),
+        "表内已有京东价": len(products) - len(open_rows),
+        "表内未填价": len(open_rows),
+        "jsonl终态已完成": len(done),
+        "失败待重试": failed,
+        "可继续跑": len(pending),
+    }
+
+
 def run_batch(
-    input_path: Path = DEFAULT_INPUT,
+    input_path: Path | None = None,
     xlsx_path: Path = DEFAULT_OUTPUT,
     jsonl_path: Path = DEFAULT_JSONL,
     profile_dir: Path = DEFAULT_PROFILE,
@@ -31,19 +110,26 @@ def run_batch(
     pick: str = "mixed",
     headless: bool = True,
     via: str = "http",
-    log=print,
+    log: Callable[[str], None] | None = None,
 ) -> dict[str, int]:
+    emit: Callable[[str], None] = log or (lambda message: print(message, flush=True))
+    input_path = resolve_input_path(input_path)
+    if not input_path.is_file():
+        raise FileNotFoundError(
+            f"找不到输入表：{input_path}\n"
+            f"可用 --input 指定，或设置环境变量 BIJIA_INPUT，"
+            f"或把工作簿放到仓库根目录命名为 {REPO_INPUT_NAME}。"
+        )
+
     products = load_products(input_path)
     done = load_done_ids(jsonl_path)
     batch = select_rows(products, limit, pick, done)
     counts = {"已匹配": 0, "待复核": 0, "京东无": 0, "失败待重试": 0}
 
-    def log(message: str) -> None:
-        print(message, flush=True)
-
-    log(f"待跑 {len(batch)} 条（挑选方式 {pick}，已完成跳过 {len(done)} 条）")
+    emit(f"输入表 {input_path}")
+    emit(f"待跑 {len(batch)} 条（挑选方式 {pick}，终态已跳过 {len(done)} 条；失败待重试会自动重跑）")
     if not batch:
-        log("没有待跑的行")
+        emit("没有待跑的行")
         return counts
 
     cache: dict[tuple, tuple[Decision, str]] = {}
@@ -51,7 +137,7 @@ def run_batch(
     client: JdHttp | JdChrome
     if via == "chrome":
         client = JdChrome()
-        log("使用当前已登录的 Chrome，会新开一个京东标签页")
+        emit("使用当前已登录的 Chrome，会新开一个京东标签页")
     else:
         client = JdHttp(cookie_file=profile_dir / "jd-state.json")
     for index, product in enumerate(batch, start=1):
@@ -60,14 +146,14 @@ def run_batch(
             decision, source = cache[key]
             source = "同款复用"
         else:
-            decision, source = _run_one(client, product, log)
+            decision, source = _run_one(client, product, emit)
             if not product.has_given_link:
                 cache[key] = (decision, source)
         record = _record(product, decision, source)
         append_record(jsonl_path, record)
         export_xlsx(jsonl_path, xlsx_path)
         counts[decision.status] = counts.get(decision.status, 0) + 1
-        log(
+        emit(
             f"[{index}/{len(batch)}] {decision.status} {product.pk_id} "
             f"{product.generic} {product.spec} -> {decision.price or '-'} {decision.shop or ''} {decision.reason}"
         )
@@ -76,17 +162,17 @@ def run_batch(
         else:
             consecutive_blocks = 0
         if consecutive_blocks >= 3:
-            log("连续被京东拦住，休息 3 分钟后放慢继续")
+            emit("连续被京东拦住，休息 3 分钟后放慢继续")
             time.sleep(180)
             client.slow = True
             consecutive_blocks = 0
         time.sleep(random.uniform(0.8, 1.6))
-    log("汇总 " + "，".join(f"{name} {value}" for name, value in counts.items()))
-    log(f"结果文件 {xlsx_path}")
+    emit("汇总 " + "，".join(f"{name} {value}" for name, value in counts.items()))
+    emit(f"结果文件 {xlsx_path}")
     return counts
 
 
-def _run_one(client: JdHttp | JdChrome, product: Product, log) -> tuple[Decision, str]:
+def _run_one(client: JdHttp | JdChrome, product: Product, log: Callable[[str], None]) -> tuple[Decision, str]:
     last_error = ""
     link_decision: Decision | None = None
     for attempt in range(3):
