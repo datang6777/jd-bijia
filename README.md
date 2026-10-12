@@ -13,16 +13,44 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-macOS 上若用 `--via chrome`（默认），需本机已安装 Google Chrome，并已在浏览器里登录京东。
+### Windows（推荐：CDP 驱动已登录 Chrome）
+
+`--via chrome` 在 Windows 上默认走 **Chrome DevTools Protocol**（端口 `9222`），不依赖 AppleScript。
+
+1. **完全退出**所有 Chrome 窗口（任务管理器里确认没有 `chrome.exe`）。
+2. 任选其一启动带远程调试的 Chrome（保留你平时的登录态）：
+
+```bat
+rem 手动启动（推荐先试这个）
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="%LOCALAPPDATA%\Google\Chrome\User Data"
+```
+
+或让本工具自动拉起（同样需要先退出 Chrome）：
+
+```bat
+python run.py --via chrome --chrome-debug-port 9222 --limit 20 --pick sequential
+```
+
+3. 在弹出的 Chrome 里确认已登录京东，再跑批次。也可用环境变量 `BIJIA_CHROME_DEBUG_PORT=9222`。
+
+**备选（不附着本机日常 Chrome）**：`python run.py --login` 后改用 `python run.py --via http --limit 20`。
+
+### macOS
+
+默认仍用 AppleScript 驱动当前已打开的 Google Chrome。若要改用 CDP（与 Windows 相同）：
+
+```bash
+python run.py --via chrome --chrome-debug-port 9222 --limit 20
+```
 
 ## 输入表路径（不再写死 Mac 桌面）
 
 优先级：
 
-1. 命令行 `--input /绝对或相对路径.xlsx`
+1. 命令行 `--input`（Windows 例：`--input %USERPROFILE%\Desktop\全量比价.xlsx`）
 2. 环境变量 `BIJIA_INPUT`
 3. 仓库根目录 `全量比价.xlsx`（若存在）
-4. `~/Desktop` 或 `~/桌面` 下的 `全量比价.xlsx` / `副本全量比价1.xlsx` 等候选
+4. 桌面候选：`Desktop` / `桌面` / OneDrive 桌面 / Windows Known Folder 下的同名或副本表
 
 默认输出：
 
@@ -76,12 +104,19 @@ python run.py --stats
 python run.py --limit 20
 ```
 
-### 用 Mac 桌面副本
+### 用桌面副本（Mac / Windows）
 
 ```bash
+# macOS
 python run.py --input "$HOME/Desktop/副本全量比价1.xlsx" --limit 20 --pick sequential
-# 中文「桌面」目录：
 python run.py --input "$HOME/桌面/全量比价.xlsx" --limit 20
+```
+
+```bat
+rem Windows CMD
+python run.py --input "%USERPROFILE%\Desktop\全量比价.xlsx" --limit 20 --pick sequential
+rem 若桌面在 OneDrive：
+python run.py --input "%OneDrive%\Desktop\全量比价.xlsx" --limit 20
 ```
 
 ### 续跑与失败重试
@@ -108,7 +143,7 @@ python run.py --limit 0 --jsonl output/比价结果.jsonl --output output/比价
 | 模块 | 作用 |
 |------|------|
 | `bijia/excel_io.py` | 流式读原表、jsonl 追加、导出结果 xlsx |
-| `bijia/jd_http.py` / `jd_chrome.py` / `jd_browser.py` | 打开商品/搜索 |
+| `bijia/jd_http.py` / `jd_chrome.py` / `jd_browser.py` | 打开商品/搜索（Chrome：macOS AppleScript 或跨平台 CDP） |
 | `bijia/match.py` + `spec.py` | 匹配与规格换算 |
 | `bijia/runner.py` | 批处理、缓存同款、频控退避 |
 | `run.py` | CLI |
@@ -124,5 +159,7 @@ python -m unittest discover -s tests -v
 ## 风险（需人工侧注意）
 
 - 京东频控 / 验证码 / 登录过期 → 暂停、`--login` 或检查 Chrome 登录后再续跑
-- `--via chrome` 依赖本机 Chrome + AppleScript（macOS）；Linux/云端一般用 `--via http` + 事先 `--login`
+- Windows `--via chrome` 需 Chrome 以 `--remote-debugging-port` 运行（先退出再启动，或让工具自动拉起）
+- macOS `--via chrome` 默认 AppleScript；也可用 `--chrome-debug-port` 走 CDP
+- 云端/无 GUI 一般用 `--via http` + 事先 `--login`
 - 全量跑完后请人工复核「待复核」行，再决定是否回写业务表

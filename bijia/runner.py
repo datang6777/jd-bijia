@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import sys
 import time
 import traceback
 from collections.abc import Callable
@@ -12,7 +13,7 @@ from pathlib import Path
 
 from bijia.excel_io import append_record, export_xlsx, load_done_ids, load_products, select_rows, unfinished
 from bijia.jd_browser import JdBlocked, SearchCard
-from bijia.jd_chrome import JdChrome
+from bijia.jd_chrome import JdChrome, create_jd_chrome
 from bijia.jd_http import JdHttp, JdLoginRequired
 from bijia.match import INVALID_BRANDS, decide, shop_tier
 from bijia.models import Decision, Offer, Product
@@ -25,9 +26,72 @@ DEFAULT_JSONL = ROOT / "output" / "比价结果.jsonl"
 DEFAULT_PROFILE = ROOT / "chrome-profile"
 
 
+def _windows_known_desktop() -> Path | None:
+    """用 Shell Known Folder 解析真实「桌面」路径（含 OneDrive 重定向）。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", wintypes.BYTE * 8),
+            ]
+
+        # FOLDERID_Desktop {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+        folder_id = GUID(
+            0xB4BFCC3A,
+            0xDB2C,
+            0x424C,
+            (wintypes.BYTE * 8)(0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41),
+        )
+        path_ptr = ctypes.c_wchar_p()
+        result = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id),
+            0,
+            None,
+            ctypes.byref(path_ptr),
+        )
+        if result != 0 or not path_ptr.value:
+            return None
+        path = Path(path_ptr.value)
+        ctypes.windll.ole32.CoTaskMemFree(path_ptr)
+        return path
+    except Exception:
+        return None
+
+
 def _desktop_dirs() -> list[Path]:
+    """跨平台桌面候选：Windows Desktop/桌面/OneDrive，以及 Known Folder。"""
     home = Path.home()
-    return [home / "Desktop", home / "桌面"]
+    dirs: list[Path] = []
+    known = _windows_known_desktop()
+    if known is not None:
+        dirs.append(known)
+    dirs.extend([home / "Desktop", home / "桌面"])
+    userprofile = os.environ.get("USERPROFILE")
+    if userprofile:
+        dirs.append(Path(userprofile) / "Desktop")
+        dirs.append(Path(userprofile) / "桌面")
+    for key in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+        base = os.environ.get(key)
+        if base:
+            dirs.append(Path(base) / "Desktop")
+            dirs.append(Path(base) / "桌面")
+    # 去重保序
+    ordered: list[Path] = []
+    seen: set[str] = set()
+    for path in dirs:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(path)
+    return ordered
 
 
 def input_candidates() -> list[Path]:
@@ -111,6 +175,8 @@ def run_batch(
     headless: bool = True,
     via: str = "http",
     log: Callable[[str], None] | None = None,
+    chrome_debug_port: int | None = None,
+    chrome_auto_launch: bool = True,
 ) -> dict[str, int]:
     emit: Callable[[str], None] = log or (lambda message: print(message, flush=True))
     input_path = resolve_input_path(input_path)
@@ -136,10 +202,46 @@ def run_batch(
     consecutive_blocks = 0
     client: JdHttp | JdChrome
     if via == "chrome":
-        client = JdChrome()
-        emit("使用当前已登录的 Chrome，会新开一个京东标签页")
+        client = create_jd_chrome(
+            debug_port=chrome_debug_port,
+            auto_launch=chrome_auto_launch,
+            log=emit,
+        )
+        backend = getattr(client, "backend", "chrome")
+        if backend == "cdp":
+            emit("使用 Chrome CDP（远程调试）驱动已登录窗口，会新开一个标签页")
+        else:
+            emit("使用当前已登录的 Chrome（AppleScript），会新开一个京东标签页")
     else:
         client = JdHttp(cookie_file=profile_dir / "jd-state.json")
+    try:
+        return _run_batch_loop(
+            client=client,
+            batch=batch,
+            jsonl_path=jsonl_path,
+            xlsx_path=xlsx_path,
+            counts=counts,
+            cache=cache,
+            consecutive_blocks=consecutive_blocks,
+            emit=emit,
+        )
+    finally:
+        closer = getattr(client, "close", None)
+        if callable(closer):
+            closer()
+
+
+def _run_batch_loop(
+    *,
+    client,
+    batch: list[Product],
+    jsonl_path: Path,
+    xlsx_path: Path,
+    counts: dict[str, int],
+    cache: dict[tuple, tuple[Decision, str]],
+    consecutive_blocks: int,
+    emit: Callable[[str], None],
+) -> dict[str, int]:
     for index, product in enumerate(batch, start=1):
         key = _identity(product)
         if key in cache and not product.has_given_link:

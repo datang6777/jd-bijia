@@ -54,11 +54,26 @@ def main() -> None:
         "--via",
         choices=("chrome", "http"),
         default="chrome",
-        help="chrome=本机已登录 Chrome；http=用 --login 保存的 cookie",
+        help="chrome=本机已登录 Chrome（Windows 用 CDP，macOS 用 AppleScript）；http=用 --login 的 cookie",
+    )
+    parser.add_argument(
+        "--chrome-debug-port",
+        type=int,
+        default=None,
+        help="Chrome 远程调试端口（默认 Windows=9222；设置后 macOS 也走 CDP）。也可用 BIJIA_CHROME_DEBUG_PORT",
+    )
+    parser.add_argument(
+        "--no-chrome-launch",
+        action="store_true",
+        help="CDP 模式下若端口未就绪则报错，不自动拉起 Chrome",
     )
     parser.add_argument("--headed", action="store_true", help="显示浏览器窗口（仅部分路径）")
     parser.add_argument("--probe", default="", help="只打开一个京东商品链接，确认能读到券后价")
-    parser.add_argument("--login", action="store_true", help="打开浏览器登录京东（券后价/搜索需要）")
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="打开浏览器登录京东，保存到 chrome-profile/jd-state.json（供 --via http）",
+    )
     parser.add_argument(
         "--stats",
         action="store_true",
@@ -92,6 +107,8 @@ def main() -> None:
         pick=args.pick,
         headless=not args.headed,
         via=args.via,
+        chrome_debug_port=args.chrome_debug_port,
+        chrome_auto_launch=not args.no_chrome_launch,
     )
 
 
@@ -143,10 +160,10 @@ def _login(profile: Path) -> None:
     state_path = profile / "jd-state.json"
     browser_dir.mkdir(parents=True, exist_ok=True)
     print("正在打开京东登录页。请在窗口里登录，登录成功后会自动检查券后价。")
+    print("（Windows/macOS 通用；登录态供 --via http 使用。若你已在本机 Chrome 登录京东，可改用 --via chrome。）")
     with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(
+        launch_kwargs = dict(
             user_data_dir=str(browser_dir),
-            channel="chrome",
             headless=False,
             locale="zh-CN",
             viewport={"width": 420, "height": 900},
@@ -154,6 +171,11 @@ def _login(profile: Path) -> None:
             is_mobile=True,
             has_touch=True,
         )
+        try:
+            context = playwright.chromium.launch_persistent_context(channel="chrome", **launch_kwargs)
+        except Exception as exc:
+            print(f"未能用系统 Chrome 启动（{exc}），改用 Playwright Chromium。")
+            context = playwright.chromium.launch_persistent_context(**launch_kwargs)
         page = context.pages[0] if context.pages else context.new_page()
         page.goto("https://plogin.m.jd.com/login/login?appid=2193&returnurl=https%3A%2F%2Fm.jd.com%2F")
         deadline = time.time() + 480
@@ -175,7 +197,7 @@ def _login(profile: Path) -> None:
         f"京东价 {offer.jd_price if offer else None}，"
         f"口径 {offer.price_source if offer else ''}"
     )
-    print("登录状态已保存。重新运行 python run.py 即可继续比价。")
+    print("登录状态已保存。可用：python run.py --via http --limit 20")
 
 
 if __name__ == "__main__":
