@@ -176,6 +176,14 @@ def _row_cells(elem: ET.Element, shared: list[str]) -> dict[int, str]:
         if not column:
             continue
         kind = cell.attrib.get("t")
+        if kind == "inlineStr":
+            # openpyxl 常把字符串写成 <is><t>...</t></is>，没有 sharedStrings / <v>
+            inline = cell.find(f"{NS}is")
+            if inline is not None:
+                texts = [node.text for node in inline.iter(f"{NS}t") if node.text]
+                if texts:
+                    cells[column] = "".join(texts)
+            continue
         value_node = cell.find(f"{NS}v")
         if kind == "s" and value_node is not None and value_node.text:
             cells[column] = shared[int(value_node.text)]
