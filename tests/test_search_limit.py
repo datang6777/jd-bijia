@@ -38,6 +38,9 @@ class SearchLimitDetectTests(unittest.TestCase):
     def test_cdp_search_sets_blocked_flag(self) -> None:
         client = JdChromeCDP.__new__(JdChromeCDP)
         client.slow = False
+        client.human = False
+        client.min_gap = 30.0
+        client.max_gap = 60.0
         client.search_blocked = False
         client.login_required = False
         client._page = object()

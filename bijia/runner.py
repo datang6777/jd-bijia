@@ -177,6 +177,9 @@ def run_batch(
     log: Callable[[str], None] | None = None,
     chrome_debug_port: int | None = None,
     chrome_auto_launch: bool = True,
+    human: bool = False,
+    min_gap: float = 30.0,
+    max_gap: float = 60.0,
 ) -> dict[str, int]:
     emit: Callable[[str], None] = log or (lambda message: print(message, flush=True))
     input_path = resolve_input_path(input_path)
@@ -206,14 +209,22 @@ def run_batch(
             debug_port=chrome_debug_port,
             auto_launch=chrome_auto_launch,
             log=emit,
+            human=human,
+            min_gap=min_gap,
+            max_gap=max_gap,
         )
         backend = getattr(client, "backend", "chrome")
         if backend == "cdp":
-            emit("使用 Chrome CDP（远程调试）驱动已登录窗口，会新开一个标签页")
+            if human:
+                emit("使用 Chrome CDP 拟人模式：复用京东标签、慢速输入/停留，不新开自动化标签")
+            else:
+                emit("使用 Chrome CDP（远程调试）驱动已登录窗口")
         else:
             emit("使用当前已登录的 Chrome（AppleScript），会新开一个京东标签页")
     else:
         client = JdHttp(cookie_file=profile_dir / "jd-state.json")
+        if human:
+            emit("提示：--human 仅对 --via chrome（CDP）生效，当前为 http 模式")
     try:
         return _run_batch_loop(
             client=client,
@@ -293,7 +304,7 @@ def _run_batch_loop(
         else:
             consecutive_blocks = 0
         # 验证码/频控/连续空搜：冷却 5–10 分钟后再继续搜索类请求
-        if consecutive_blocks >= 2:
+        if consecutive_blocks >= 2 and not getattr(client, "human", False):
             cool = random.uniform(300, 600)
             emit(
                 f"连续被京东搜索拦住或空结果，冷却 {int(cool // 60)} 分钟后放慢继续；"
@@ -302,7 +313,14 @@ def _run_batch_loop(
             time.sleep(cool)
             client.slow = True
             consecutive_blocks = 0
-        time.sleep(random.uniform(0.8, 1.6))
+        if getattr(client, "human", False):
+            lo = float(getattr(client, "min_gap", 30.0))
+            hi = float(getattr(client, "max_gap", 60.0))
+            gap = random.uniform(lo, max(hi, lo))
+            emit(f"拟人行间隔 {gap:.0f}s …")
+            time.sleep(gap)
+        else:
+            time.sleep(random.uniform(0.8, 1.6))
     emit("汇总 " + "，".join(f"{name} {value}" for name, value in counts.items()))
     emit(f"结果文件 {xlsx_path}")
     if getattr(client, "search_blocked", False):
@@ -313,7 +331,9 @@ def _run_batch_loop(
 def _run_one(client: JdHttp | JdChrome, product: Product, log: Callable[[str], None]) -> tuple[Decision, str]:
     last_error = ""
     link_decision: Decision | None = None
-    for attempt in range(3):
+    # 拟人模式里验证页已在客户端等人手过，避免再快速连打 3 次
+    attempts = 1 if getattr(client, "human", False) else 3
+    for attempt in range(attempts):
         try:
             if product.has_given_link:
                 offer = client.open_offer(product.given_link)
@@ -359,7 +379,7 @@ def _run_one(client: JdHttp | JdChrome, product: Product, log: Callable[[str], N
             log(f"  {product.pk_id} 出错：{exc}")
             traceback.print_exc()
             time.sleep(5)
-            if attempt == 2:
+            if attempt >= attempts - 1:
                 break
     return Decision(status="失败待重试", reason=last_error or "重试后仍失败"), "失败"
 

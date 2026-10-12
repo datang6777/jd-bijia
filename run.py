@@ -67,6 +67,23 @@ def main() -> None:
         action="store_true",
         help="CDP 模式下若端口未就绪则报错，不自动拉起 Chrome",
     )
+    parser.add_argument(
+        "--human",
+        action="store_true",
+        help="CDP 拟人模式：复用京东标签、搜索框逐字输入、停留滚动、验证页等人手过",
+    )
+    parser.add_argument(
+        "--min-gap",
+        type=float,
+        default=30.0,
+        help="拟人模式下每行之间的最短间隔秒数（默认 30）",
+    )
+    parser.add_argument(
+        "--max-gap",
+        type=float,
+        default=60.0,
+        help="拟人模式下每行之间的最长间隔秒数（默认 60）",
+    )
     parser.add_argument("--headed", action="store_true", help="显示浏览器窗口（仅部分路径）")
     parser.add_argument("--probe", default="", help="只打开一个京东商品链接，确认能读到券后价")
     parser.add_argument(
@@ -109,6 +126,9 @@ def main() -> None:
         via=args.via,
         chrome_debug_port=args.chrome_debug_port,
         chrome_auto_launch=not args.no_chrome_launch,
+        human=args.human,
+        min_gap=args.min_gap,
+        max_gap=args.max_gap,
     )
 
 

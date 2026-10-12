@@ -222,11 +222,24 @@ def create_jd_chrome(
     auto_launch: bool = True,
     user_data_dir: Path | None = None,
     log: Callable[[str], None] | None = None,
+    human: bool = False,
+    min_gap: float = 30.0,
+    max_gap: float = 60.0,
 ) -> "JdChromeAppleScript | JdChromeCDP":
     backend, port = resolve_chrome_backend(debug_port)
     if backend == "cdp":
         assert port is not None
-        return JdChromeCDP(port=port, auto_launch=auto_launch, user_data_dir=user_data_dir, log=log)
+        return JdChromeCDP(
+            port=port,
+            auto_launch=auto_launch,
+            user_data_dir=user_data_dir,
+            log=log,
+            human=human,
+            min_gap=min_gap,
+            max_gap=max_gap,
+        )
+    if human and log:
+        log("注意：--human 仅对 CDP（Windows / --chrome-debug-port）生效；当前为 AppleScript 后端")
     return JdChromeAppleScript()
 
 
@@ -239,13 +252,42 @@ class JdChrome:
         auto_launch: bool = True,
         user_data_dir: Path | None = None,
         log: Callable[[str], None] | None = None,
+        human: bool = False,
+        min_gap: float = 30.0,
+        max_gap: float = 60.0,
     ):
         return create_jd_chrome(
             debug_port=debug_port,
             auto_launch=auto_launch,
             user_data_dir=user_data_dir,
             log=log,
+            human=human,
+            min_gap=min_gap,
+            max_gap=max_gap,
         )
+
+
+STEALTH_INIT_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+"""
+
+
+def pick_existing_jd_page(browser) -> tuple[object, object, bool]:
+    """返回 (context, page, owned)。owned=True 表示新建的标签页。"""
+    for context in browser.contexts:
+        for page in context.pages:
+            try:
+                url = page.url or ""
+            except Exception:
+                continue
+            if "jd.com" in url or "jingdonghealth" in url:
+                return context, page, False
+    if browser.contexts:
+        context = browser.contexts[0]
+    else:
+        context = browser.new_context()
+    page = context.new_page()
+    return context, page, True
 
 
 class JdChromeAppleScript:
@@ -402,7 +444,10 @@ class JdChromeAppleScript:
 
 
 class JdChromeCDP:
-    """通过 CDP 附着/驱动 Chrome（Windows 主路径，也可用在 Mac/Linux）。"""
+    """通过 CDP 附着/驱动 Chrome（Windows 主路径，也可用在 Mac/Linux）。
+
+    human=True 时：复用已有京东标签、拟人输入/停留、验证页等人手过，行间随机间隔。
+    """
 
     def __init__(
         self,
@@ -410,16 +455,24 @@ class JdChromeCDP:
         auto_launch: bool = True,
         user_data_dir: Path | None = None,
         log: Callable[[str], None] | None = None,
+        human: bool = False,
+        min_gap: float = 30.0,
+        max_gap: float = 60.0,
     ) -> None:
         self.port = int(port)
         self.slow = False
         self.search_blocked = False
         self.login_required = False
         self.backend = "cdp"
+        self.human = bool(human)
+        self.min_gap = float(min_gap)
+        self.max_gap = max(float(max_gap), self.min_gap)
         self._log = log or (lambda message: print(message, flush=True))
         self._playwright = None
         self._browser = None
+        self._context = None
         self._page = None
+        self._owned_page = False
         ensure_cdp_chrome(self.port, auto_launch=auto_launch, user_data_dir=user_data_dir, log=self._log)
         self._connect()
 
@@ -429,17 +482,38 @@ class JdChromeCDP:
         self._playwright = sync_playwright().start()
         endpoint = cdp_endpoint(self.port)
         self._browser = self._playwright.chromium.connect_over_cdp(endpoint)
-        if self._browser.contexts:
-            context = self._browser.contexts[0]
+        context, page, owned = pick_existing_jd_page(self._browser)
+        self._context = context
+        self._page = page
+        self._owned_page = owned
+        try:
+            context.add_init_script(STEALTH_INIT_JS)
+        except Exception:
+            pass
+        self._apply_stealth()
+        if owned:
+            self._log(f"CDP 已附着 Chrome（{endpoint}），未找到京东标签，已新开一页")
+            if self.human:
+                self._human_goto("https://www.jd.com/")
         else:
-            context = self._browser.new_context()
-        self._page = context.new_page()
-        self._log(f"CDP 已附着 Chrome（{endpoint}），将使用新标签页访问京东")
+            self._log(f"CDP 已附着 Chrome（{endpoint}），复用已有京东标签：{(page.url or '')[:80]}")
+        if self.human:
+            self._log(
+                f"拟人模式已开启：搜索框逐字输入、停留滚动、验证页等人手过；"
+                f"行间隔 {self.min_gap:.0f}–{self.max_gap:.0f}s"
+            )
+
+    def _apply_stealth(self) -> None:
+        assert self._page is not None
+        try:
+            self._page.evaluate(STEALTH_INIT_JS)
+        except Exception:
+            pass
 
     def close(self) -> None:
-        # 只断开 CDP，不关闭用户的 Chrome 进程
+        # 只断开 CDP；复用的用户标签页不关闭
         try:
-            if self._page is not None:
+            if self._owned_page and self._page is not None:
                 self._page.close()
         except Exception:
             pass
@@ -454,6 +528,7 @@ class JdChromeCDP:
         except Exception:
             pass
         self._page = None
+        self._context = None
         self._browser = None
         self._playwright = None
 
@@ -461,10 +536,17 @@ class JdChromeCDP:
         sku = _sku_from_url(url)
         if not sku:
             return None
-        self._goto(_canonical_url(url, sku))
+        target = _canonical_url(url, sku)
+        if self.human:
+            self._human_goto(target)
+        else:
+            self._goto(target)
         payload = self._wait_item()
         if _is_risk(payload.get("href", ""), payload.get("text", "")):
-            raise JdBlocked("京东弹出了验证或频控，等待后重试")
+            if self.human and self._wait_manual_captcha():
+                payload = self._wait_item()
+            if _is_risk(payload.get("href", ""), payload.get("text", "")):
+                raise JdBlocked("京东弹出了验证或频控，等待后重试")
         offer = offer_from_item(payload, sku)
         if hint and not offer.shop:
             offer.shop = hint.shop
@@ -479,13 +561,21 @@ class JdChromeCDP:
             raise JdLoginRequired("京东要求登录后才能搜索")
         if self.search_blocked:
             raise JdBlocked("搜索已被频控，本轮其余搜索先跳过；请改用 --pick links 或稍后再试")
-        self._goto(f"https://search.jd.com/Search?keyword={quote(keyword)}&enc=utf-8")
+        if self.human:
+            self._human_search(keyword)
+        else:
+            self._goto(f"https://search.jd.com/Search?keyword={quote(keyword)}&enc=utf-8")
         payload = self._wait_search()
         text = payload.get("text") or ""
         href = payload.get("href") or ""
         if _is_search_limited(href, text) or _is_risk(href, text):
-            self.search_blocked = True
-            raise JdBlocked(_search_block_reason(text))
+            if self.human and self._wait_manual_captcha():
+                payload = self._wait_search()
+                text = payload.get("text") or ""
+                href = payload.get("href") or ""
+            if _is_search_limited(href, text) or _is_risk(href, text):
+                self.search_blocked = True
+                raise JdBlocked(_search_block_reason(text))
         if "plogin" in href or "请登录" in text[:200]:
             self.login_required = True
             raise JdLoginRequired("搜索页要求重新登录京东")
@@ -498,9 +588,114 @@ class JdChromeCDP:
         self._page.goto(url, wait_until="domcontentloaded", timeout=45000)
         time.sleep(2.0 if self.slow else 1.0)
 
+    def _human_goto(self, url: str) -> None:
+        """像从京东站内打开链接：带 www.jd.com referer，再停留滚动。"""
+        assert self._page is not None
+        self._apply_stealth()
+        self._page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=60000,
+            referer="https://www.jd.com/",
+        )
+        self._human_dwell()
+
+    def _human_search(self, keyword: str) -> None:
+        """在页面搜索框逐字输入并回车，不直接拼 Search URL。"""
+        assert self._page is not None
+        self._apply_stealth()
+        current = ""
+        try:
+            current = self._page.url or ""
+        except Exception:
+            current = ""
+        if "jd.com" not in current and "jingdonghealth" not in current:
+            self._human_goto("https://www.jd.com/")
+        box = self._find_search_box()
+        if box is None:
+            # 回退：先回首页再找一次
+            self._human_goto("https://www.jd.com/")
+            box = self._find_search_box()
+        if box is None:
+            raise JdBlocked("拟人搜索找不到京东搜索框，请在复用的标签页打开 www.jd.com 后重试")
+        box.click(timeout=8000)
+        time.sleep(random.uniform(0.2, 0.6))
+        # 清空后逐字输入
+        try:
+            box.fill("")
+        except Exception:
+            self._page.keyboard.press("Control+A")
+            self._page.keyboard.press("Backspace")
+        for char in keyword:
+            box.type(char, delay=random.randint(70, 220))
+            time.sleep(random.uniform(0.02, 0.12))
+        time.sleep(random.uniform(0.3, 0.9))
+        self._page.keyboard.press("Enter")
+        self._human_dwell()
+
+    def _find_search_box(self):
+        assert self._page is not None
+        selectors = (
+            "#key",
+            "input#key",
+            "input[name='keyword']",
+            "input[aria-label*='搜索']",
+            ".search-bar input[type='text']",
+            "#search input[type='text']",
+        )
+        for selector in selectors:
+            locator = self._page.locator(selector).first
+            try:
+                if locator.count() and locator.is_visible(timeout=800):
+                    return locator
+            except Exception:
+                continue
+        return None
+
+    def _human_dwell(self) -> None:
+        assert self._page is not None
+        scrolls = random.randint(2, 5)
+        for _ in range(scrolls):
+            try:
+                self._page.mouse.wheel(0, random.randint(180, 720))
+            except Exception:
+                pass
+            time.sleep(random.uniform(0.25, 0.85))
+        time.sleep(random.uniform(3.0, 8.0))
+
+    def _wait_manual_captcha(self, timeout: float = 180.0) -> bool:
+        """检测到验证页时不狂重试，等人手过，最多约 3 分钟。"""
+        assert self._page is not None
+        self._log(
+            "检测到京东验证/风控页。请在这个 Chrome 窗口里手动完成验证；"
+            f"将等待最多 {int(timeout)} 秒，通过后自动继续……"
+        )
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(5.0)
+            try:
+                href = self._page.url or ""
+                text = self._page.evaluate(
+                    "() => ((document.body && document.body.innerText) || '').slice(0, 800)"
+                )
+            except Exception:
+                continue
+            if isinstance(text, str) and not _is_risk(href, text) and not _is_search_limited(href, text):
+                # 也排除仍明显是验证文案
+                if any(word in text for word in ("验证一下", "安全验证", "滑动验证")):
+                    continue
+                self._log("验证页似乎已通过，继续读取页面。")
+                self._human_dwell()
+                return True
+            remaining = int(deadline - time.time())
+            if remaining > 0 and remaining % 30 < 5:
+                self._log(f"仍在验证页，剩余约 {remaining}s……")
+        self._log("验证等待超时。请手动通过后再重新运行本批。")
+        return False
+
     def _wait_item(self) -> dict:
         last: dict = {"href": "", "title": "", "text": ""}
-        deadline = time.time() + (24 if not self.slow else 30)
+        deadline = time.time() + (40 if self.human else (24 if not self.slow else 30))
         while time.time() < deadline:
             last = self._read_page(ITEM_JS)
             text = last.get("text") or ""
@@ -513,7 +708,7 @@ class JdChromeCDP:
 
     def _wait_search(self) -> dict:
         last: dict = {"href": "", "title": "", "text": "", "items": []}
-        deadline = time.time() + 18
+        deadline = time.time() + (28 if self.human else 18)
         while time.time() < deadline:
             last = self._read_page(SEARCH_JS)
             if last.get("items") or _is_risk(last.get("href", ""), last.get("text", "")):
