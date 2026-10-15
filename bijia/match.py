@@ -41,10 +41,17 @@ def shop_tier(shop: str, text: str = "") -> int:
     return 3
 
 
-def decide(product: Product, offers: list[Offer], search_ok: bool, error: str = "") -> Decision:
+def decide(
+    product: Product,
+    offers: list[Offer],
+    search_ok: bool,
+    error: str = "",
+    prefer_sku: str = "",
+) -> Decision:
     if not search_ok:
         return Decision(status="失败待重试", reason=error or "页面没有打开，稍后重试")
 
+    prefer = (prefer_sku or "").strip()
     ranked: list[_Scored] = []
     saw_generic = False
     drop_reasons: list[str] = []
@@ -62,22 +69,48 @@ def decide(product: Product, offers: list[Offer], search_ok: bool, error: str = 
 
     if not ranked:
         if price_gap is not None and set(drop_reasons) <= {"price"}:
-            needs_login = "登录" in (price_gap.offer.price_source or "")
+            gap_offer = price_gap.offer
+            # 有可读京东价/券后价时，不因「需要登录」文案丢掉价格
+            usable, basis = _pick_price(gap_offer)
+            if usable is not None:
+                return Decision(
+                    status="待复核",
+                    price=_fmt_price(usable),
+                    url=gap_offer.url,
+                    shop=gap_offer.shop,
+                    title=_one_line(gap_offer.title),
+                    region=gap_offer.region,
+                    confidence="低",
+                    reason=f"页面价格可读（{basis}），匹配信心不足，留待复核",
+                    price_basis=basis,
+                    sku=gap_offer.sku,
+                )
+            needs_login = "登录" in (gap_offer.price_source or "")
             return Decision(
                 status="失败待重试",
-                url=price_gap.offer.url,
-                shop=price_gap.offer.shop,
-                title=_one_line(price_gap.offer.title),
-                region=price_gap.offer.region,
-                reason="京东未登录，券后价要登录后才显示" if needs_login else "商品页打开了，但没有读到价格",
+                url=gap_offer.url,
+                shop=gap_offer.shop,
+                title=_one_line(gap_offer.title),
+                region=gap_offer.region,
+                reason="京东未登录，券后价要登录后才显示"
+                if needs_login
+                else "搜索列表没有读到价格（可能懒加载或需登录）",
             )
         if saw_generic:
             return Decision(status="京东无", reason="搜到了同名商品，但品牌、规格或口味型号对不上，或该地区无货")
         return Decision(status="京东无", reason="没有搜到品牌、名称、规格对得上的在售商品")
 
-    ranked.sort(key=lambda item: item.sort_key)
+    ranked.sort(
+        key=lambda item: (
+            0 if prefer and item.offer.sku == prefer else 1,
+            *item.sort_key,
+        )
+    )
     best = ranked[0]
     status = "已匹配" if best.high else "待复核"
+    reason = best.reason
+    if prefer and best.offer.sku == prefer:
+        reason = "链接 SKU 命中搜索列表；" + reason
     return Decision(
         status=status,
         price=best.price_text,
@@ -88,7 +121,7 @@ def decide(product: Product, offers: list[Offer], search_ok: bool, error: str = 
         factor_text=best.factor_text,
         region=best.offer.region,
         confidence="高" if best.high else "低",
-        reason=best.reason,
+        reason=reason,
         price_basis=best.price_basis,
         sku=best.offer.sku,
     )
@@ -227,6 +260,8 @@ class _Scored:
 def _pick_price(offer: Offer) -> tuple[float | None, str]:
     if offer.coupon_price is not None and offer.coupon_price > 0:
         return offer.coupon_price, "券后价"
+    if offer.price_source == "搜索列表价" and offer.jd_price is not None and offer.jd_price > 0:
+        return offer.jd_price, "搜索列表价"
     if offer.jd_price is not None and offer.jd_price > 0:
         return offer.jd_price, "页面没显示券后价，先用京东价"
     return None, ""

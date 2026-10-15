@@ -52,7 +52,7 @@ class JdHttp:
         if self.login_required:
             raise JdLoginRequired("京东要求登录后才能搜索")
         if self.search_blocked:
-            raise JdBlocked("搜索连续被京东拦住，本轮其余搜索先跳过")
+            raise JdBlocked("搜索已被频控，本轮其余搜索先跳过；请改用 --pick links 或稍后再试")
         html, final = self._get(
             f"https://so.m.jd.com/ware/search.action?keyword={quote(keyword)}",
             referer="https://m.jd.com/",
@@ -62,7 +62,10 @@ class JdHttp:
         except JdLoginRequired:
             self.login_required = True
             raise
-        except JdBlocked:
+        except JdBlocked as first:
+            if "访问频繁" in str(first) or "无法搜索" in str(first):
+                self.search_blocked = True
+                raise
             time.sleep(45)
             html, final = self._get(
                 f"https://so.m.jd.com/ware/search.action?keyword={quote(keyword)}",
@@ -73,9 +76,13 @@ class JdHttp:
             except JdLoginRequired:
                 self.login_required = True
                 raise
-            except JdBlocked:
+            except JdBlocked as second:
                 self.search_blocked = True
-                raise JdBlocked("搜索连续被京东拦住，本轮其余搜索先跳过") from None
+                if "访问频繁" in str(second) or "无法搜索" in str(second):
+                    raise
+                raise JdBlocked(
+                    "搜索连续被京东拦住，本轮其余搜索先跳过；有京东链接的行请改用 --pick links"
+                ) from None
         cards: list[SearchCard] = []
         seen: set[str] = set()
         for sku, title in _search_hits(html):
@@ -135,24 +142,38 @@ def parse_mobile_item(html: str, sku: str, url: str) -> Offer:
     coupon = _number(price_text)
     jd_price = _number(jd_text)
     source = ""
-    if coupon is None and jd_price is None and price_text and "?" in price_text:
-        source = "需要登录"
+    # 软登录：页面可能藏券后价，但只要京东价可读就不当成必须登录
+    if jd_price is not None:
+        if coupon is not None:
+            nearby = html
+            pos = html.find(f'"price":"{price_text}"')
+            if pos >= 0:
+                nearby = html[max(0, pos - 120) : pos + 160]
+            source = "券后价" if "到手" in nearby else "页面售价"
+        else:
+            source = "页面没显示券后价，先用京东价"
     elif coupon is not None:
         nearby = html
         pos = html.find(f'"price":"{price_text}"')
         if pos >= 0:
             nearby = html[max(0, pos - 120) : pos + 160]
         source = "券后价" if "到手" in nearby else "页面售价"
+    elif price_text and "?" in price_text:
+        source = "需要登录"
     region = _region(html)
     approvals = " ".join(re.findall(r"国药准字\s*[A-Za-z]\s*[A-Za-z0-9]{6,}", html)[:3])
     page_text = " ".join(part for part in (title, shop, brand, region, approvals) if part)
+    coupon_price = coupon if source == "券后价" else None
+    # 页面售价落到 jd_price；已有 jd_price 则保留
+    if jd_price is None and source == "页面售价" and coupon is not None:
+        jd_price = coupon
     return Offer(
         sku=sku,
         url=url,
         title=title,
         shop=shop,
-        coupon_price=coupon if source == "券后价" else None,
-        jd_price=jd_price if jd_price is not None else (coupon if source != "券后价" else None),
+        coupon_price=coupon_price,
+        jd_price=jd_price,
         in_stock=in_stock,
         region=region,
         page_text=page_text,
@@ -169,7 +190,17 @@ def _search_hits(html: str) -> list[tuple[str, str]]:
 
 
 def _raise_for_gate(html: str, final: str, allow_item: bool) -> None:
-    blob = f"{final}\n{html[:500]}"
+    blob = f"{final}\n{html[:800]}"
+    if (
+        "访问频繁" in blob
+        or "无法搜索" in blob
+        or "搜索太频繁" in blob
+        or ("搜索" in blob and "稍后再试" in blob)
+    ):
+        raise JdBlocked(
+            "京东搜索频控：访问频繁导致无法搜索，请稍后再试。"
+            "本轮其余搜索先跳过；有京东链接的行请改用 --pick links"
+        )
     if "risk_handler" in blob or "验证一下" in blob or "pc-frequent-pro" in final:
         raise JdBlocked("京东弹出了验证或频控，等待后重试")
     if "人数过多" in html:

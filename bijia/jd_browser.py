@@ -95,6 +95,8 @@ class SearchCard:
     text: str
     shop: str
     sales: int
+    price: float | None = None
+    self_operated: bool = False
 
 
 class JdBrowser:
