@@ -242,6 +242,7 @@ def run_batch(
             consecutive_blocks=consecutive_blocks,
             emit=emit,
             search_only=search_only,
+            pick=pick,
         )
     finally:
         closer = getattr(client, "close", None)
@@ -272,6 +273,7 @@ def _run_batch_loop(
     consecutive_blocks: int,
     emit: Callable[[str], None],
     search_only: bool = False,
+    pick: str = "mixed",
 ) -> dict[str, int]:
     search_tip_shown = False
     for index, product in enumerate(batch, start=1):
@@ -300,7 +302,9 @@ def _run_batch_loop(
                 decision, source = cache[key]
                 source = "同款复用"
             else:
-                decision, source = _run_one(client, product, emit, search_only=search_only)
+                decision, source = _run_one(
+                    client, product, emit, search_only=search_only, pick=pick
+                )
                 if not product.has_given_link:
                     cache[key] = (decision, source)
         record = _record(product, decision, source)
@@ -347,12 +351,14 @@ def _run_one(
     product: Product,
     log: Callable[[str], None],
     search_only: bool = False,
+    pick: str = "mixed",
 ) -> tuple[Decision, str]:
     last_error = ""
     link_decision: Decision | None = None
     use_search_only = search_only or getattr(client, "search_only", False)
+    links_only = pick == "links"
     # 拟人模式里验证页已在客户端等人手过，避免再快速连打 3 次
-    attempts = 1 if getattr(client, "human", False) or use_search_only else 3
+    attempts = 1 if getattr(client, "human", False) or use_search_only or links_only else 3
     for attempt in range(attempts):
         try:
             if use_search_only:
@@ -361,10 +367,17 @@ def _run_one(
                 offer = client.open_offer(product.given_link)
                 if offer is None or not offer.title:
                     raise JdBlocked("商品页没有读到标题")
-                link_decision = decide(product, [offer], True)
+                from bijia.jd_chrome import _sku_from_url
+
+                prefer_sku = _sku_from_url(product.given_link)
+                link_decision = decide(product, [offer], True, prefer_sku=prefer_sku)
                 if link_decision.status != "京东无":
                     return link_decision, "已有链接"
+                if links_only:
+                    return _links_only_from_offer(product, offer, link_decision, prefer_sku), "已有链接"
                 log(f"  已有链接对不上（{link_decision.reason}），改为搜索")
+            elif links_only:
+                return Decision(status="失败待重试", reason="--pick links 但该行没有京东链接"), "无链接"
             offers = _search_offers(client, product)
             return decide(product, offers, True), "搜索"
         except JdLoginRequired as exc:
@@ -404,6 +417,36 @@ def _run_one(
             if attempt >= attempts - 1:
                 break
     return Decision(status="失败待重试", reason=last_error or "重试后仍失败"), "失败"
+
+
+def _links_only_from_offer(
+    product: Product,
+    offer: Offer,
+    link_decision: Decision,
+    prefer_sku: str,
+) -> Decision:
+    """--pick links：链接已打开且 decide=京东无时，有价格则待复核，绝不改搜。"""
+    from bijia.match import _fmt_price, _pick_price
+
+    price, basis = _pick_price(offer)
+    if price is None:
+        return link_decision
+    return Decision(
+        status="待复核",
+        price=_fmt_price(price),
+        url=offer.url or link_decision.url,
+        shop=offer.shop or link_decision.shop,
+        title=(offer.title or link_decision.title)[:180],
+        region=offer.region or link_decision.region,
+        confidence="低",
+        reason=(
+            f"已有链接打开成功但自动匹配未过关（{link_decision.reason}），"
+            f"保留页面价格供复核"
+            + (f"；SKU {prefer_sku}" if prefer_sku else "")
+        ),
+        price_basis=basis or offer.price_source or "京东价",
+        sku=offer.sku or prefer_sku,
+    )
 
 
 def _run_one_search_only(

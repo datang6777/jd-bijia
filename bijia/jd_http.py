@@ -142,24 +142,38 @@ def parse_mobile_item(html: str, sku: str, url: str) -> Offer:
     coupon = _number(price_text)
     jd_price = _number(jd_text)
     source = ""
-    if coupon is None and jd_price is None and price_text and "?" in price_text:
-        source = "需要登录"
+    # 软登录：页面可能藏券后价，但只要京东价可读就不当成必须登录
+    if jd_price is not None:
+        if coupon is not None:
+            nearby = html
+            pos = html.find(f'"price":"{price_text}"')
+            if pos >= 0:
+                nearby = html[max(0, pos - 120) : pos + 160]
+            source = "券后价" if "到手" in nearby else "页面售价"
+        else:
+            source = "页面没显示券后价，先用京东价"
     elif coupon is not None:
         nearby = html
         pos = html.find(f'"price":"{price_text}"')
         if pos >= 0:
             nearby = html[max(0, pos - 120) : pos + 160]
         source = "券后价" if "到手" in nearby else "页面售价"
+    elif price_text and "?" in price_text:
+        source = "需要登录"
     region = _region(html)
     approvals = " ".join(re.findall(r"国药准字\s*[A-Za-z]\s*[A-Za-z0-9]{6,}", html)[:3])
     page_text = " ".join(part for part in (title, shop, brand, region, approvals) if part)
+    coupon_price = coupon if source == "券后价" else None
+    # 页面售价落到 jd_price；已有 jd_price 则保留
+    if jd_price is None and source == "页面售价" and coupon is not None:
+        jd_price = coupon
     return Offer(
         sku=sku,
         url=url,
         title=title,
         shop=shop,
-        coupon_price=coupon if source == "券后价" else None,
-        jd_price=jd_price if jd_price is not None else (coupon if source != "券后价" else None),
+        coupon_price=coupon_price,
+        jd_price=jd_price,
         in_stock=in_stock,
         region=region,
         page_text=page_text,

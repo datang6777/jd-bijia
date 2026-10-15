@@ -69,13 +69,29 @@ def decide(
 
     if not ranked:
         if price_gap is not None and set(drop_reasons) <= {"price"}:
-            needs_login = "登录" in (price_gap.offer.price_source or "")
+            gap_offer = price_gap.offer
+            # 有可读京东价/券后价时，不因「需要登录」文案丢掉价格
+            usable, basis = _pick_price(gap_offer)
+            if usable is not None:
+                return Decision(
+                    status="待复核",
+                    price=_fmt_price(usable),
+                    url=gap_offer.url,
+                    shop=gap_offer.shop,
+                    title=_one_line(gap_offer.title),
+                    region=gap_offer.region,
+                    confidence="低",
+                    reason=f"页面价格可读（{basis}），匹配信心不足，留待复核",
+                    price_basis=basis,
+                    sku=gap_offer.sku,
+                )
+            needs_login = "登录" in (gap_offer.price_source or "")
             return Decision(
                 status="失败待重试",
-                url=price_gap.offer.url,
-                shop=price_gap.offer.shop,
-                title=_one_line(price_gap.offer.title),
-                region=price_gap.offer.region,
+                url=gap_offer.url,
+                shop=gap_offer.shop,
+                title=_one_line(gap_offer.title),
+                region=gap_offer.region,
                 reason="京东未登录，券后价要登录后才显示"
                 if needs_login
                 else "搜索列表没有读到价格（可能懒加载或需登录）",
